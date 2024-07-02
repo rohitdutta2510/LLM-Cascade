@@ -1,0 +1,4 @@
+export CUDA_VISIBLE_DEVICES=1
+export TOKENIZERS_PARALLELISM=false
+
+python llmcascade_boolq_single_scorer.py

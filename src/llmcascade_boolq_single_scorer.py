@@ -20,9 +20,9 @@ from sklearn.metrics import f1_score, precision_score, recall_score
 ###############################################################################################################
 
 # INDIR = '../llm-sust/datasets/datasets_train_256/'
-PREDDIR = '../llm-sust/temp_outs/temp_outs_cascade/'
-TRAIN_DATA_PATH = '../llm-sust/datasets/datasets_llm_cascade/boolq_train_1k.csv'
-TEST_DATA_PATH = '../llm-sust/datasets/datasets_llm_cascade/boolq_test_1k.csv'
+PREDDIR = '../../llm-sust/temp_outs/temp_outs_cascade/'
+TRAIN_DATA_PATH = '../../llm-sust/datasets/datasets_llm_cascade/boolq_train_1k.csv'
+TEST_DATA_PATH = '../../llm-sust/datasets/datasets_llm_cascade/boolq_test_1k.csv'
 
 DEVICE = 'cuda:0'
 
@@ -57,7 +57,8 @@ def get_data_boolq(datadir, preddir, modelname):
 
     # qa = [query + str(ans) for query, ans in zip(rawdata.prompt_text, gold)]
     qa = [query + str(ans) for query, ans in zip(rawdata.prompt_text, pred)]
-    return {'query_answer' : qa, 'score' : result}
+    # return {'query_answer' : qa, 'score' : result}
+    return qa, result
 
 ################################################################################################################
 
@@ -84,7 +85,7 @@ def compute_metrics(eval_pred):
 ################################################################################################################
 
 def train(train_texts, train_labels, save_dir = './boolq'):
-    train_texts, val_texts, train_labels, val_labels = train_test_split(train_texts, train_labels, test_size=.6)
+    train_texts, val_texts, train_labels, val_labels = train_test_split(train_texts, train_labels, test_size=.2)
     # print("train_text 0",train_texts[0])
     # print("val_text 0",val_texts[0])
 
@@ -98,8 +99,8 @@ def train(train_texts, train_labels, save_dir = './boolq'):
     training_args = TrainingArguments(
         output_dir='./output',          # output directory
         num_train_epochs=10,              # total number of training epochs
-        learning_rate = 2e-5,  
-        per_device_train_batch_size=16,  # batch size per device during training
+        learning_rate = 5e-5,               # initial learning rate
+        per_device_train_batch_size=32,  # batch size per device during training
         per_device_eval_batch_size=64,   # batch size for evaluation
         # warmup_steps=500,                # number of warmup steps for learning rate scheduler
         # weight_decay=0.01,               # strength of weight decay
@@ -130,11 +131,15 @@ def train(train_texts, train_labels, save_dir = './boolq'):
 ################################################################################################################
 
 def build_cascade(llm_chain = ['flan-t5-base', 'flan-t5-large'], cascade_name = 'default'):
-
+    query_ans, result = [], [] 
     for model in llm_chain:
-        data = get_data_boolq(TRAIN_DATA_PATH, PREDDIR, model)
-        save_path = './boolq/' + cascade_name + '/' + model
-        train(data['query_answer'], data['score'], save_path)
+        qa, res = get_data_boolq(TRAIN_DATA_PATH, PREDDIR, model)
+        query_ans.extend(qa)
+        result.extend(res)
+    
+    print('No. of training data: ', len(query_ans))
+    save_path = './boolq_single_scorer/' + cascade_name
+    train(query_ans, result, save_path)
 
     print('\n\nBuilding LLM Cascade successful !!')
 
@@ -150,6 +155,7 @@ def get_score(text, scorer_path):
 
     model.eval()
 
+    # Create TensorDataset and DataLoader
     dataset = data_utils.TensorDataset(test_encodings['input_ids'], test_encodings['attention_mask'])
     dataloader = data_utils.DataLoader(dataset, batch_size=4)
 
@@ -164,16 +170,6 @@ def get_score(text, scorer_path):
             all_probs.extend(probs.cpu().numpy())
     
     return all_probs
-
-    # with torch.no_grad():
-    #     outputs = model(**test_encodings)
-    #     probs = F.softmax(outputs.logits, dim=-1)
-    #     # predictions = torch.argmax(outputs.logits, dim=-1)
-
-    # # print("Outputs:", outputs)
-    # # print("Probabilities:", probs.cpu().numpy())
-    # # print("Predictions:", predictions)
-    # return probs.cpu().numpy()
 
 ################################################################################################################
 
@@ -222,76 +218,77 @@ def run_llm(model_path, data_loader, MAXGENTOKENS=50):
 
 ################################################################################################################
 
-def data_thresholding(rawdata, preds, score, thresh = 0.9):
+def data_thresholding(rawdata, preds, golds, score, thresh):
     comp_prompts = []
     comp_preds = []
+    comp_golds = []
     rem_prompts = []
-    # rem_preds = []
-    for raw, pr, sc in zip(rawdata, preds, score):
-        if sc[0] > thresh or sc[1] > thresh:
+    rem_golds = []
+
+    for raw, pr, gd, sc in zip(rawdata, preds, golds, score):
+        if sc[1] > thresh:
             comp_prompts.append(raw)
             comp_preds.append(pr)
+            comp_golds.append(gd)
         else:
             rem_prompts.append(raw)
-            # rem_preds.append(pr)
+            rem_golds.append(gd)
 
-    return comp_prompts, comp_preds, rem_prompts
+    return comp_prompts, comp_preds, comp_golds, rem_prompts, rem_golds
 
 ################################################################################################################
 
-def run_cascade(cascade_name, llm_chain, cascade_length, data_path):
+def run_cascade(cascade_name, llm_chain, cascade_length, data_path, threshold=0.8):
     # print('Cascade Length: ', cascade_length)
-
     df = pd.read_csv(data_path)
     df = df.sort_values('prompt_text', key = lambda col: col.apply(len))
-    rawdata = df['prompt_text'].values.tolist()
-    gold = df['label'].values.tolist()
+    raw_prompts = df['prompt_text'].values.tolist()
+    raw_golds = df['label'].values.tolist()
     
-    prompts = []
-    preds = []
+    final_prompts = []
+    final_preds = []
+    final_golds = []
 
     for idx, llm in enumerate(llm_chain):
-        print(idx+1, llm)
-        data_loader = data_utils.DataLoader(rawdata, batch_size=16)
+        print(f'{idx+1}. {llm}')
+        data_loader = data_utils.DataLoader(raw_prompts, batch_size=16)
         model_name = llm.split('/')[-1]
         response = run_llm(llm, data_loader)
         
         if 'flan' not in model_name:
-            preddata = [pr[len(raw):] for pr, raw in zip(response[0], rawdata)]
-        preddata = map(str.lower, response[0]) 
-        preddata = [1 if "true" in pr or "yes" in pr else 0 for pr in preddata] 
-
-        # torch.cuda.empty_cache()
+            pred_data = [pr[len(raw):] for pr, raw in zip(response[0], raw_prompts)]
+        pred_data = map(str.lower, response[0]) 
+        pred_data = [1 if "true" in pr or "yes" in pr else 0 for pr in pred_data] 
 
         if idx+1 != cascade_length:       # if current llm is not the last llm of the chain
-            qa = [query + str(ans) for query, ans in zip(rawdata, preddata)] 
-            score = get_score(qa, './boolq/' + cascade_name + '/' + model_name)
+            qa = [query + str(ans) for query, ans in zip(raw_prompts, pred_data)] 
+            score = get_score(qa, './boolq_single_scorer/' + cascade_name)
 
             # print(response[0][:5])
             # print(pred[:5])
             # print(qa[:5])
             # print(score[:5])
 
-            comp_prompts, comp_preds, rem_prompts = data_thresholding(rawdata, preddata, score, 0.95)
-            prompts.extend(comp_prompts)
-            preds.extend(comp_preds)
-            rawdata = rem_prompts
-            print(len(prompts), len(preds), len(rawdata))
+            comp_prompts, comp_preds, comp_golds, rem_prompts, rem_golds = data_thresholding(raw_prompts, pred_data, raw_golds, score, threshold)
+            final_prompts.extend(comp_prompts)
+            final_preds.extend(comp_preds)
+            final_golds.extend(comp_golds)
 
-            if len(rawdata) == 0:
+            raw_prompts = rem_prompts
+            raw_golds = rem_golds
+
+            print(f'Completed: {len(final_prompts)}, Remaining: {len(raw_prompts)}')
+
+            if len(raw_prompts) == 0:
                 break
         else:
-            prompts.extend(rawdata)
-            preds.extend(preddata)
+            final_prompts.extend(raw_prompts)
+            final_preds.extend(pred_data)
+            final_golds.extend(raw_golds)
 
-        torch.cuda.empty_cache()
-    
-    final_data = pd.DataFrame({'prompt_text':prompts, 'preds': preds})
-    final_data = final_data.sort_values('prompt_text', key = lambda col: col.apply(len))
-
-    prec = round(precision_score(gold, final_data['preds'].values.tolist(), average="macro") * 100, 1)
-    rec = round(recall_score(gold, final_data['preds'].values.tolist(), average="macro") * 100, 1)
-    f1 = round(f1_score(gold, final_data['preds'].values.tolist(), average="macro") * 100, 1)
+    prec = round(precision_score(final_golds, final_preds, average="macro") * 100, 1)
+    rec = round(recall_score(final_golds, final_preds, average="macro") * 100, 1)
+    f1 = round(f1_score(final_golds, final_preds, average="macro") * 100, 1)
 
     print('\n')
     print(f'Precision: {prec}, Recall: {rec}, F1-Score: {f1}')
@@ -302,9 +299,9 @@ def run_cascade(cascade_name, llm_chain, cascade_length, data_path):
 if __name__ == '__main__':
 
     # llm_chain = ['flan-t5-base', 'flan-t5-large', 'flan-t5-xl']
-    # chain_name = 'strategy_2'
+    # chain_name = 'strategy_1'
     # build_cascade(llm_chain, chain_name)
     
     llm_chain = ['google/flan-t5-base', 'google/flan-t5-large', 'google/flan-t5-xl']
-    chain_name = 'strategy_2'
-    run_cascade(chain_name, llm_chain, len(llm_chain), TEST_DATA_PATH)
+    chain_name = 'strategy_1'
+    run_cascade(chain_name, llm_chain, len(llm_chain), TEST_DATA_PATH, 0.95)
