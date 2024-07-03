@@ -12,7 +12,7 @@ from statistics import mean
 # datasets = ['boolq', 'copa', 'qnli', 'cola', 'stsb', 'sst2', 'mnli', 'mrpc', 'wnli', 'cnn_dm']
 # datasets = ['cola', 'qnli', 'wnli', 'mnli']
 # datasets = ['boolq', 'sst2']
-datasets = ['mnli']
+datasets = ['boolq', 'mnli']
 # datasets = ['boolq', 'vax', 'caves', 'sst2', 'stsb', 'copa', 'cola', 'mrpc', 'mnli', 'qnli', 'samsum', 'dolly', 'hatex']
 
 
@@ -249,8 +249,8 @@ def eval_mnli(datadir, preddir, outdir):
 
         print(outdata[-1])
         
-    df2 = pd.DataFrame(outdata, columns = ["Model", "M-Pre", "M-Rec", "M-F1"])
-    df2.to_csv(os.path.join(outdir, "mnli.csv"), index = False)
+    # df2 = pd.DataFrame(outdata, columns = ["Model", "M-Pre", "M-Rec", "M-F1"])
+    # df2.to_csv(os.path.join(outdir, "mnli.csv"), index = False)
 
 
 
@@ -680,8 +680,8 @@ def eval_hatex(datadir, preddir, outdir):
 #########################################################################################
 #########################################################################################
 if __name__ == '__main__':
-    if not os.path.exists(OUTDIR):
-        os.makedirs(OUTDIR)
+    # if not os.path.exists(OUTDIR):
+    #     os.makedirs(OUTDIR)
 
 
     for name in datasets:

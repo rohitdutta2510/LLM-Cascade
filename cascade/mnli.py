@@ -22,7 +22,7 @@ from sklearn.metrics import f1_score, precision_score, recall_score
 PREDDIR = '../temp_outs/'
 TRAIN_DATA_PATH = '../datasets/mnli_train_1k.csv'
 TEST_DATA_PATH = '../datasets/mnli_test_1k.csv'
-OUTDIR_BASE = '../temp_outs'
+OUTDIR = '../performance/'
 
 DEVICE = 'cuda:0'
 
@@ -83,7 +83,7 @@ def compute_metrics(eval_pred):
 
 ################################################################################################################
 
-def train(train_texts, train_labels, save_dir = './mnli'):
+def train(train_texts, train_labels, lr, epochs, save_dir = './mnli'):
     train_texts, val_texts, train_labels, val_labels = train_test_split(train_texts, train_labels, test_size=.6)
     # print("train_text 0",train_texts[0])
     # print("val_text 0",val_texts[0])
@@ -97,8 +97,8 @@ def train(train_texts, train_labels, save_dir = './mnli'):
 
     training_args = TrainingArguments(
         output_dir='../checkpoints',          # output directory
-        num_train_epochs=10,              # total number of training epochs
-        learning_rate = 2e-5,  
+        num_train_epochs=epochs,              # total number of training epochs
+        learning_rate=lr,  
         per_device_train_batch_size=16,  # batch size per device during training
         per_device_eval_batch_size=64,   # batch size for evaluation
         # warmup_steps=500,                # number of warmup steps for learning rate scheduler
@@ -129,12 +129,17 @@ def train(train_texts, train_labels, save_dir = './mnli'):
         
 ################################################################################################################
 
-def build_cascade(llm_chain = ['flan-t5-base', 'flan-t5-large', 'flan-t5-xl'], cascade_name = 'default'):
+def build_cascade(llm_chain, cascade_name = 'default', lr = 1e-5, epochs = 10):
 
     for model in llm_chain:
         data = get_data_mnli(TRAIN_DATA_PATH, PREDDIR, model)
-        save_path = '../models/mnli/' + cascade_name + '/' + model
-        train(data['query_answer'], data['score'], save_path)
+        # save_path = '../models/mnli/' + cascade_name + '/' + model
+        save_path = os.path.join('../models/mnli', cascade_name, model)
+        train(data['query_answer'], data['score'], lr, epochs, save_path)
+
+    log_path = os.path.join('../models/mnli', cascade_name, 'log.csv')
+    logs = pd.DataFrame([[lr, epochs]], columns = ["Learning rate", "Epochs"])
+    logs.to_csv(log_path, index = False)
 
     print('\n\nBuilding LLM Cascade successful !!')
 
@@ -218,7 +223,7 @@ def data_thresholding(rawdata, preds, golds, score, thresh):
     rem_prompts = []
     rem_golds = []
 
-    for raw, rp, pr, gd, sc in zip(rawdata, preds, golds, score):
+    for raw, pr, gd, sc in zip(rawdata, preds, golds, score):
         if sc[1] > thresh:
             comp_preds.append(pr)
             comp_golds.append(gd)
@@ -280,18 +285,39 @@ def run_cascade(cascade_name, llm_chain, cascade_length, data_path, threshold = 
     rec = round(recall_score(final_golds, final_preds, average="macro") * 100, 1)
     f1 = round(f1_score(final_golds, final_preds, average="macro") * 100, 1)
 
-    print('\n')
-    print(f'Precision: {prec}, Recall: {rec}, F1-Score: {f1}')
+    print(f'\nPrecision: {prec}, Recall: {rec}, F1-Score: {f1}\n')
+
+    return [cascade_name, threshold, prec, rec, f1]
 
 ################################################################################################################
 
 
 if __name__ == '__main__':
 
-    # llm_chain = ['flan-t5-base', 'flan-t5-large', 'flan-t5-xl']
-    # chain_name = 'strategy_1'
-    # build_cascade(llm_chain, chain_name)
-    
-    llm_chain = ['google/flan-t5-base', 'google/flan-t5-large', 'google/flan-t5-xl']
-    chain_name = 'strategy_1'
-    run_cascade(chain_name, llm_chain, len(llm_chain), TEST_DATA_PATH, 0.9)
+    # TRAINING
+
+    llm_chain = ['flan-t5-base', 'flan-t5-large', 'flan-t5-xl']
+    model_list = ['strategy_2', 'strategy_3', 'strategy_4','strategy_5']
+    lr_rate = [1e-5, 2e-5, 5e-5, 1e-4]
+    num_epochs = 10
+
+    for model, lr in zip(model_list, lr_rate):
+        build_cascade(llm_chain, model, lr, num_epochs)
+
+    # INFERENCE
+
+    if not os.path.exists(OUTDIR):
+        os.makedirs(OUTDIR)
+
+    chain_1 = ['google/flan-t5-base', 'google/flan-t5-large', 'google/flan-t5-xl']
+    model_list = ['strategy_1', 'strategy_2', 'strategy_3', 'strategy_4', 'strategy_5']
+    chain_list = [chain_1, chain_1, chain_1, chain_1, chain_1]
+    threshold = [0.9, 0.95]
+
+    output = []
+    for model, llm_chain in zip(model_list, chain_list):
+        for th in threshold:
+            output.append(run_cascade(model, llm_chain, len(llm_chain), TEST_DATA_PATH, th))
+
+    df = pd.DataFrame(output, columns = ["Model", "Threshold", "M-Pre", "M-Rec", "M-F1"])
+    df.to_csv(os.path.join(OUTDIR, "mnli.csv"), index = False)

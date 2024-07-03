@@ -19,49 +19,46 @@ from sklearn.metrics import f1_score, precision_score, recall_score
 
 ###############################################################################################################
 
-INDIR = '../llm-sust/datasets/datasets_train_256/'
-PREDDIR = '../llm-sust/temp_outs/temp_outs_frozen_16/'
-# OUTDIR = 'performance/'
-DATA_PATH = '../llm-sust/datasets/datasets_train_256/cnn_dm.csv'
+PREDDIR = '../temp_outs/'
+TRAIN_DATA_PATH = '../datasets/mnli_train_1k.csv'
+TEST_DATA_PATH = '../datasets/mnli_test_1k.csv'
+OUTDIR = '../performance/'
 
 DEVICE = 'cuda:0'
-TRACK_GPU = os.environ['CUDA_VISIBLE_DEVICES'] if 'CUDA_VISIBLE_DEVICES' in os.environ else DEVICE[-1]
-# device = "cuda:1" if torch.cuda.is_available() else "cpu"
 
 metric = evaluate.load("accuracy")
 
 ################################################################################################################
 
-def get_data_cnndm(datadir, preddir, modelname):
-    bertscore = evaluate.load("bertscore")
-
-    rawdata = pd.read_csv(os.path.join(datadir, "cnn_dm.csv"))
+def get_data_mnli(datadir, preddir, modelname):
+    rawdata = pd.read_csv(datadir)
     rawdata = rawdata.sort_values('prompt_text', key = lambda col: col.apply(len))
-    gold = rawdata['highlights'].apply(str.lower).values.tolist()
-
-    dn = preddir + '/cnn_dm_' + modelname + '/'
+    gold = rawdata['label'].values.tolist()
+    
+    dn = preddir + '/mnli_train_1k_' + modelname + '/'
         
     try:
         with open(os.path.join(dn, "output.json")) as fp:
             preddata, timestamps = json.load(fp)
-        
-        if 'flan' not in modelname:
-            preddata = [pr[len(raw):] for pr, raw in zip(preddata, rawdata.prompt_text)]
-        preddata = map(str.lower, preddata)        
-        pred = list(preddata)
+            if 'flan' not in modelname:
+                preddata = [pr[len(raw):] for pr, raw in zip(preddata, rawdata.prompt_text)]
+            preddata = map(str.lower, preddata) 
+
+            pred = [1 if "1" in pr or "neutral" in pr else 2 if "2" in pr or "contradict" in pr or "contradiction" in pr else 0 for pr in preddata]
 
     except FileNotFoundError:
-        print("Skipping", dn)
-            
-    bert_score = bertscore.compute(predictions=pred, references=gold, model_type="distilbert-base-uncased")
+        print("Skipping", dn)     
+        
+    result = [1 if pred[i] == gold[i] else 0 for i in range(len(gold))]
 
-    # print(gold[:1])
-    # print(pred[:1])
-    print(bert_score['f1'][:10])
+    # print(gold[:10])
+    # print(pred[:10])
+    # print(result[:10])
 
     # qa = [query + str(ans) for query, ans in zip(rawdata.prompt_text, gold)]
-    qa = [query + ans for query, ans in zip(rawdata.prompt_text, pred)]
-    return {'query_answer' : qa, 'score' : bert_score['f1']}
+    qa = [query + str(ans) for query, ans in zip(rawdata.prompt_text, pred)]
+    # return {'query_answer' : qa, 'score' : result}
+    return qa, result
 
 ################################################################################################################
 
@@ -87,7 +84,7 @@ def compute_metrics(eval_pred):
 
 ################################################################################################################
 
-def train(train_texts, train_labels, save_dir = './cnn_dm'):
+def train(train_texts, train_labels, lr, epochs, save_dir = './mnli'):
     train_texts, val_texts, train_labels, val_labels = train_test_split(train_texts, train_labels, test_size=.6)
     # print("train_text 0",train_texts[0])
     # print("val_text 0",val_texts[0])
@@ -100,18 +97,19 @@ def train(train_texts, train_labels, save_dir = './cnn_dm'):
     val_dataset = CustomDataset(val_encodings, val_labels)
 
     training_args = TrainingArguments(
-        output_dir='./scorer_location',          # output directory
-        num_train_epochs=8,              # total number of training epochs
+        output_dir='../checkpoints',          # output directory
+        num_train_epochs=epochs,              # total number of training epochs
+        learning_rate=lr,  
         per_device_train_batch_size=16,  # batch size per device during training
         per_device_eval_batch_size=64,   # batch size for evaluation
-        warmup_steps=500,                # number of warmup steps for learning rate scheduler
-        weight_decay=0.01,               # strength of weight decay
+        # warmup_steps=500,                # number of warmup steps for learning rate scheduler
+        # weight_decay=0.01,               # strength of weight decay
         logging_dir='./logs',            # directory for storing logs
         logging_steps=10,
         evaluation_strategy="epoch",
         save_strategy ="epoch",
         load_best_model_at_end=True,
-        seed=2023,
+        # seed=42,
     )
 
     model = DistilBertForSequenceClassification.from_pretrained("distilbert-base-uncased")
@@ -132,12 +130,20 @@ def train(train_texts, train_labels, save_dir = './cnn_dm'):
         
 ################################################################################################################
 
-def build_cascade(llm_chain = ['flan-t5-base', 'flan-t5-large'], cascade_name = 'default'):
-
+def build_cascade(llm_chain, cascade_name = 'default', lr = 1e-5, epochs = 10):
+    query_ans, result = [], []
     for model in llm_chain:
-        data = get_data_boolq(INDIR, PREDDIR, model)
-        save_path = './boolq/' + cascade_name + '/' + model
-        train(data['query_answer'], data['score'], save_path)
+        qa, res = get_data_mnli(TRAIN_DATA_PATH, PREDDIR, model)
+        query_ans.extend(qa)
+        result.extend(res)
+
+
+    save_path = os.path.join('../models/mnli_single_scorer', cascade_name)
+    train(query_ans, result, lr, epochs, save_path)
+
+    log_path = os.path.join('../models/mnli_single_scorer', cascade_name, 'log.csv')
+    logs = pd.DataFrame([[lr, epochs]], columns = ["Learning rate", "Epochs"])
+    logs.to_csv(log_path, index = False)
 
     print('\n\nBuilding LLM Cascade successful !!')
 
@@ -152,15 +158,21 @@ def get_score(text, scorer_path):
     test_encodings = {key: value.to(DEVICE) for key, value in test_encodings.items()}
 
     model.eval()
-    with torch.no_grad():
-        outputs = model(**test_encodings)
-        probs = F.softmax(outputs.logits, dim=-1)
-        # predictions = torch.argmax(outputs.logits, dim=-1)
 
-    # print("Outputs:", outputs)
-    # print("Probabilities:", probs.cpu().numpy())
-    # print("Predictions:", predictions)
-    return probs.cpu().numpy()
+    dataset = data_utils.TensorDataset(test_encodings['input_ids'], test_encodings['attention_mask'])
+    dataloader = data_utils.DataLoader(dataset, batch_size=4)
+
+    all_probs = []
+
+    model.eval()
+    with torch.no_grad():
+        for batch in dataloader:
+            input_ids, attention_mask = batch
+            outputs = model(input_ids=input_ids, attention_mask=attention_mask)
+            probs = F.softmax(outputs.logits, dim=-1)
+            all_probs.extend(probs.cpu().numpy())
+    
+    return all_probs
 
 ################################################################################################################
 
@@ -209,92 +221,107 @@ def run_llm(model_path, data_loader, MAXGENTOKENS=50):
 
 ################################################################################################################
 
-def data_thresholding(rawdata, preds, score, thresh = 0.7):
-    comp_prompts = []
+def data_thresholding(rawdata, preds, golds, score, thresh):
     comp_preds = []
+    comp_golds = []
     rem_prompts = []
-    # rem_preds = []
-    for raw, pr, sc in zip(rawdata, preds, score):
-        if sc[0] > thresh or sc[1] > thresh:
-            comp_prompts.append(raw)
+    rem_golds = []
+
+    for raw, pr, gd, sc in zip(rawdata, preds, golds, score):
+        if sc[1] > thresh:
             comp_preds.append(pr)
+            comp_golds.append(gd)
         else:
             rem_prompts.append(raw)
-            # rem_preds.append(pr)
+            rem_golds.append(gd)
 
-    return comp_prompts, comp_preds, rem_prompts
+    return comp_preds, comp_golds, rem_prompts, rem_golds
 
 ################################################################################################################
 
-def run_cascade(cascade_name, llm_chain, cascade_length, data_path):
-    # rawdata = pd.read_csv(data_path).prompt_text
-    # rawdata = rawdata.sort_values(key = lambda col: col.apply(len))
-    # rawdata = rawdata.values.tolist()
-
+def run_cascade(cascade_name, llm_chain, cascade_length, data_path, threshold = 0.8):
+    # print('Cascade Length: ', cascade_length)
     df = pd.read_csv(data_path)
     df = df.sort_values('prompt_text', key = lambda col: col.apply(len))
-    rawdata = df['prompt_text'].values.tolist()
-    gold = df['label'].values.tolist()
+
+    raw_prompts = df['prompt_text'].values.tolist()
+    raw_golds = df['label'].values.tolist()
     
-    prompts = []
-    preds = []
+    final_preds = []
+    final_golds = []
 
     for idx, llm in enumerate(llm_chain):
-        data_loader = data_utils.DataLoader(rawdata, batch_size=8)
+        print(f'\n{idx+1}. {llm}')
+        data_loader = data_utils.DataLoader(raw_prompts, batch_size=16)
         model_name = llm.split('/')[-1]
-        response = run_llm(llm, data_loader)
-        
+        response, ts = run_llm(llm, data_loader)
+
         if 'flan' not in model_name:
-            preddata = [pr[len(raw):] for pr, raw in zip(response[0], rawdata)]
-        preddata = map(str.lower, response[0]) 
-        preddata = [1 if "true" in pr or "yes" in pr else 0 for pr in preddata] 
+            pred_data = [pr[len(raw):] for pr, raw in zip(response, raw_prompts)]
+        pred_data = map(str.lower, response) 
+        pred_data = [1 if "1" in pr or "neutral" in pr else 2 if "2" in pr or "contradict" in pr or "contradiction" in pr else 0 for pr in pred_data]
 
         if idx+1 != cascade_length:       # if current llm is not the last llm of the chain
-            qa = [query + str(ans) for query, ans in zip(rawdata, preddata)] 
-            score = get_score(qa, './boolq/' + cascade_name + '/' + model_name)
+            qa = [query + str(ans) for query, ans in zip(raw_prompts, pred_data)] 
+            score = get_score(qa, '../models/mnli_single_scorer/' + cascade_name)
 
             # print(response[0][:5])
-            # print(pred[:5])
+            # print(pred_data[:5])
             # print(qa[:5])
             # print(score[:5])
+            
+            comp_preds, comp_golds, rem_prompts, rem_golds = data_thresholding(raw_prompts, pred_data, raw_golds, score, threshold)
 
-            comp_prompts, comp_preds, rem_prompts = data_thresholding(rawdata, preddata, score, 0.7)
-            prompts.extend(comp_prompts)
-            preds.extend(comp_preds)
-            rawdata = rem_prompts
-            # print(len(prompts), len(preds), len(rawdata))
+            final_preds.extend(comp_preds)
+            final_golds.extend(comp_golds)
+            raw_prompts = rem_prompts
+            raw_golds = rem_golds
 
-            if len(rawdata) == 0:
+            print(f'Completed: {len(final_golds)}, Remaining: {len(rem_golds)}')
+
+            if len(raw_prompts) == 0:
                 break
         else:
-            prompts.extend(rawdata)
-            preds.extend(preddata)
-    
-    final_data = pd.DataFrame({'prompt_text':prompts, 'preds': preds})
-    final_data = final_data.sort_values('prompt_text', key = lambda col: col.apply(len))
+            final_preds.extend(pred_data)
+            final_golds.extend(raw_golds)
 
-    prec = round(precision_score(gold, final_data['preds'].values.tolist(), average="macro") * 100, 1)
-    rec = round(recall_score(gold, final_data['preds'].values.tolist(), average="macro") * 100, 1)
-    f1 = round(f1_score(gold, final_data['preds'].values.tolist(), average="macro") * 100, 1)
+    prec = round(precision_score(final_golds, final_preds, average="macro") * 100, 1)
+    rec = round(recall_score(final_golds, final_preds, average="macro") * 100, 1)
+    f1 = round(f1_score(final_golds, final_preds, average="macro") * 100, 1)
 
-    print('\n')
-    print(f'Precision: {prec}, Recall: {rec}, F1-Score: {f1}')
+    print(f'\nPrecision: {prec}, Recall: {rec}, F1-Score: {f1}\n')
+
+    return [cascade_name, threshold, prec, rec, f1]
 
 ################################################################################################################
 
 
 if __name__ == '__main__':
 
-    llm_chain = ['flan-t5-base', 'flan-t5-large', 'Mistral-7B-Instruct-v0.2']
-    chain_name = 'strategy_1'
-    data = get_data_cnndm(INDIR, PREDDIR, "flan-t5-base")
-    # print(data['query_answer'][:1], '\n', data['score'][:1])
-    # train(data['query_answer'], data['score'])
-    # score = get_score(data['query_answer'][:5])
-    # print(score)
+    # TRAINING
 
-    # build_cascade(llm_chain, chain_name)
-    # run_cascade('strategy_1', ['google/flan-t5-base', 'google/flan-t5-large', 'mistralai/Mistral-7B-Instruct-v0.2'], DATA_PATH)
-    # llm_chain = ['google/flan-t5-base', 'google/flan-t5-large', 'mistralai/Mistral-7B-Instruct-v0.2']
-    # chain_name = 'strategy_1'
-    # run_cascade(chain_name, llm_chain, len(chain_name), DATA_PATH)
+    llm_chain = ['flan-t5-base', 'flan-t5-large', 'flan-t5-xl']
+    model_list = ['strategy_1', 'strategy_2', 'strategy_3', 'strategy_4']
+    lr_rate = [1e-5, 2e-5, 5e-5, 1e-4]
+    num_epochs = 10
+
+    for model, lr in zip(model_list, lr_rate):
+        build_cascade(llm_chain, model, lr, num_epochs)
+
+    # INFERENCE
+
+    if not os.path.exists(OUTDIR):
+        os.makedirs(OUTDIR)
+
+    chain_1 = ['google/flan-t5-base', 'google/flan-t5-large', 'google/flan-t5-xl']
+    model_list = ['strategy_1', 'strategy_2', 'strategy_3', 'strategy_4']
+    chain_list = [chain_1, chain_1, chain_1, chain_1, chain_1]
+    threshold = [0.9, 0.95]
+
+    output = []
+    for model, llm_chain in zip(model_list, chain_list):
+        for th in threshold:
+            output.append(run_cascade(model, llm_chain, len(llm_chain), TEST_DATA_PATH, th))
+
+    df = pd.DataFrame(output, columns = ["Model", "Threshold", "M-Pre", "M-Rec", "M-F1"])
+    df.to_csv(os.path.join(OUTDIR, "mnli_single_scorer.csv"), index = False)
