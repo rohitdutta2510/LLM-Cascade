@@ -1,13 +1,13 @@
-export CUDA_VISIBLE_DEVICES=1
+export CUDA_VISIBLE_DEVICES=2
 export TOKENIZERS_PARALLELISM=false
 
 
 
-for bs in 32;
+for bs in 8;
 do
-    for dataset in mnli_test_1k;
+    for dataset in boolq_train_1k;
     do
-        for llm in google/flan-t5-base google/flan-t5-large google/flan-t5-xl;
+        for llm in microsoft/Phi-3-mini-4k-instruct;
         do
             python run_llm.py $llm ../datasets/$dataset.csv --out_dir ../temp_outs/ --max_gen_tokens 100 --bs $bs
         done

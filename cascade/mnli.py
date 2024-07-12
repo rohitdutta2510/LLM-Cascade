@@ -23,8 +23,10 @@ PREDDIR = '../temp_outs/'
 TRAIN_DATA_PATH = '../datasets/mnli_train_1k.csv'
 TEST_DATA_PATH = '../datasets/mnli_test_1k.csv'
 OUTDIR = '../performance/'
+ENERGY_OUT_DIR_BASE = '../temp_outs/'
 
 DEVICE = 'cuda:0'
+TRACK_GPU = os.environ['CUDA_VISIBLE_DEVICES'] if 'CUDA_VISIBLE_DEVICES' in os.environ else DEVICE[-1]
 
 metric = evaluate.load("accuracy")
 
@@ -172,7 +174,7 @@ def get_score(text, scorer_path):
 
 ################################################################################################################
 
-def run_llm(model_path, data_loader, MAXGENTOKENS=50):
+def run_llm(model_path, data_loader, data_name, cascade_name, thresh, batch_offset, ENERGY_OUT_DIR, maxgentokens=50):
     tokenizer = AutoTokenizer.from_pretrained(model_path)
     if 'flan-t5' in model_path:
         model = AutoModelForSeq2SeqLM.from_pretrained(model_path, device_map = DEVICE, torch_dtype=torch.float16)
@@ -187,33 +189,39 @@ def run_llm(model_path, data_loader, MAXGENTOKENS=50):
 
     results = []
     timestamps = []
+    new_batch_offset = None
 
     try:
         for idx, batch in enumerate(tqdm(data_loader, ncols = 50)):
-            
-            st = time()
+            bn = batch_offset + idx
+            with OfflineEmissionsTracker(project_name="%s_%s-%s_%d"%(data_name, cascade_name, thresh, bn), experiment_id=bn, country_iso_code="IND", log_level="error",
+                                     tracking_mode="process", output_dir=ENERGY_OUT_DIR, measure_power_secs=1, gpu_ids=TRACK_GPU) as tracker2:
+                st = time()
 
-            batchdata = tokenizer(batch, return_tensors="pt", padding = True, truncation =  True)
-            inp = batchdata.input_ids.to(DEVICE)
-            attn = batchdata.attention_mask.to(DEVICE)
-            
-            outputs = model.generate(inp, attention_mask=attn, max_new_tokens=MAXGENTOKENS, pad_token_id=tokenizer.pad_token_id)
+                batchdata = tokenizer(batch, return_tensors="pt", padding = True, truncation =  True)
+                inp = batchdata.input_ids.to(DEVICE)
+                attn = batchdata.attention_mask.to(DEVICE)
+                
+                outputs = model.generate(inp, attention_mask=attn, max_new_tokens=maxgentokens, pad_token_id=tokenizer.pad_token_id)
 
-            end = time()
+                end = time()
+
             results.extend(outputs)
             timestamps.append((st,end))
+            new_batch_offset = bn
 
             gc.collect()
             torch.cuda.empty_cache()
 
     except Exception as e:
         print("ERROR:", e)
+        tracker2.stop()
         raise e
     
     results = [tokenizer.batch_decode(results, skip_special_tokens=True), timestamps]
     torch.cuda.empty_cache()
 
-    return results
+    return results, new_batch_offset
 
 ################################################################################################################
 
@@ -236,25 +244,33 @@ def data_thresholding(rawdata, preds, golds, score, thresh):
 ################################################################################################################
 
 def run_cascade(cascade_name, llm_chain, cascade_length, data_path, threshold = 0.8):
+    data_name = data_path.split('/')[-1].split('.')[-2]
+
+    ENERGY_OUT_DIR = ENERGY_OUT_DIR_BASE + f'{data_name}_{cascade_name}-{threshold}'
+    if not os.path.exists(ENERGY_OUT_DIR):
+        os.makedirs(ENERGY_OUT_DIR)
+    else:
+        os.system("rm " + os.path.join(ENERGY_OUT_DIR, "emissions.csv"))
+    
     # print('Cascade Length: ', cascade_length)
     df = pd.read_csv(data_path)
     df = df.sort_values('prompt_text', key = lambda col: col.apply(len))
-
     raw_prompts = df['prompt_text'].values.tolist()
     raw_golds = df['label'].values.tolist()
     
     final_preds = []
     final_golds = []
 
+    batch_offset = 0
     for idx, llm in enumerate(llm_chain):
         print(f'\n{idx+1}. {llm}')
         data_loader = data_utils.DataLoader(raw_prompts, batch_size=16)
         model_name = llm.split('/')[-1]
-        response, ts = run_llm(llm, data_loader)
+        response, batch_offset = run_llm(llm, data_loader, data_name, cascade_name, threshold, batch_offset, ENERGY_OUT_DIR)
 
         if 'flan' not in model_name:
-            pred_data = [pr[len(raw):] for pr, raw in zip(response, raw_prompts)]
-        pred_data = map(str.lower, response) 
+            pred_data = [pr[len(raw):] for pr, raw in zip(response[0], raw_prompts)]
+        pred_data = map(str.lower, response[0]) 
         pred_data = [1 if "1" in pr or "neutral" in pr else 2 if "2" in pr or "contradict" in pr or "contradiction" in pr else 0 for pr in pred_data]
 
         if idx+1 != cascade_length:       # if current llm is not the last llm of the chain
@@ -267,11 +283,12 @@ def run_cascade(cascade_name, llm_chain, cascade_length, data_path, threshold = 
             # print(score[:5])
             
             comp_preds, comp_golds, rem_prompts, rem_golds = data_thresholding(raw_prompts, pred_data, raw_golds, score, threshold)
-
             final_preds.extend(comp_preds)
             final_golds.extend(comp_golds)
+
             raw_prompts = rem_prompts
             raw_golds = rem_golds
+            batch_offset += 1
 
             print(f'Completed: {len(final_golds)}, Remaining: {len(rem_golds)}')
 

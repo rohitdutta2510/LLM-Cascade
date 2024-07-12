@@ -12,7 +12,7 @@ from statistics import mean
 # datasets = ['boolq', 'copa', 'qnli', 'cola', 'stsb', 'sst2', 'mnli', 'mrpc', 'wnli', 'cnn_dm']
 # datasets = ['cola', 'qnli', 'wnli', 'mnli']
 # datasets = ['boolq', 'sst2']
-datasets = ['boolq', 'mnli']
+datasets = ['boolq']
 # datasets = ['boolq', 'vax', 'caves', 'sst2', 'stsb', 'copa', 'cola', 'mrpc', 'mnli', 'qnli', 'samsum', 'dolly', 'hatex']
 
 

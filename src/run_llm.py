@@ -11,7 +11,7 @@ import pandas as pd
 from tqdm import tqdm
 from time import time, sleep
 import torch.utils.data as data_utils
-from transformers import AutoTokenizer, AutoModelForSeq2SeqLM, AutoModelForCausalLM
+from transformers import AutoTokenizer, AutoModelForSeq2SeqLM, AutoModelForCausalLM, BitsAndBytesConfig
 from peft import PeftModel
 from codecarbon import EmissionsTracker, OfflineEmissionsTracker
 # from ptflops import get_model_complexity_info
@@ -74,9 +74,18 @@ else:
 ############################################################################################################
 # %% LOAD TOKENIZER AND MODEL
 
-tokenizer = AutoTokenizer.from_pretrained(MODEL_PATH)
+if 'Phi-3' in MODEL_PATH:
+    tokenizer = AutoTokenizer.from_pretrained(MODEL_PATH, trust_remote_code=True)
+else:
+    tokenizer = AutoTokenizer.from_pretrained(MODEL_PATH)
+
 if 'flan-t5' in MODEL_PATH:
     model = AutoModelForSeq2SeqLM.from_pretrained(MODEL_PATH, device_map = DEVICE, torch_dtype=torch.float16)
+elif 'Phi-3-medium-4k-instruct' in MODEL_PATH:
+    quantization_config = BitsAndBytesConfig(load_in_8bit=True, bnb_8bit_compute_dtype=torch.float16)
+    model = AutoModelForCausalLM.from_pretrained(MODEL_PATH, quantization_config=quantization_config, device_map = DEVICE, torch_dtype=torch.float16, trust_remote_code=True, attn_implementation="flash_attention_2")
+elif 'Phi-3' in MODEL_PATH:
+    model = AutoModelForCausalLM.from_pretrained(MODEL_PATH, device_map = DEVICE, torch_dtype=torch.bfloat16, trust_remote_code=True, attn_implementation="flash_attention_2")
 else:
     model = AutoModelForCausalLM.from_pretrained(MODEL_PATH, device_map = DEVICE, torch_dtype=torch.bfloat16)
     # model.bfloat16()
@@ -150,7 +159,7 @@ except Exception as e:
 
 ############################################################################################################
 # %% DUMP RESULTS
-with open(os.path.join(OUT_DIR, "output.json"), 'w') as fo:
+with open(os.path.join(OUT_DIR, "output.json"), 'w', encoding ='utf8') as fo:
     json.dump([tokenizer.batch_decode(results, skip_special_tokens=True), timestamps], fo, indent = 4, ensure_ascii=False)
 
 

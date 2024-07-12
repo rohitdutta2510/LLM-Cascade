@@ -1,0 +1,13 @@
+strategy-1 --> lr : 1e-05, epochs: 10
+strategy-2 --> lr : 2e-05, epochs: 10
+strategy-3 --> lr : 4e-05, epochs: 10
+strategy-4 --> lr : 4e-04, epochs: 10
+strategy-5 --> lr : 2e-05, epochs: 10 (Original o/p training)
+strategy-6 --> lr : 4e-05, epochs: 10 (Original o/p training)
+
+single-scorer-strategy-1 --> 
+single-scorer-strategy-2 --> lr : 1e-05, epochs: 10
+single-scorer-strategy-3 --> lr : 2e-05, epochs: 10
+single-scorer-strategy-4 --> lr : 4e-05, epochs: 10
+single-scorer-strategy-5 --> lr : 2e-05, epochs: 10 (Original o/p training)
+single-scorer-strategy-6 --> lr : 4e-05, epochs: 10 (Original o/p training)
