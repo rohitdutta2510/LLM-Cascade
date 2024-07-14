@@ -1,0 +1,18 @@
+2024-07-03 23:53:28 - CarbonTracker: The following components were found: GPU with device(s) NVIDIA RTX A5000. CPU with device(s) cpu:1, cpu:0.
+2024-07-03 23:53:30 - CarbonTracker: Average carbon intensity during training was 626.01 gCO2/kWh at detected location: Delhi, Delhi, IN.
+2024-07-03 23:53:30 - CarbonTracker: 
+Actual consumption for 1 epoch(s):
+	Time:	0:00:01
+	Energy:	0.000030096202 kWh
+	CO2eq:	0.018840436130 g
+	This is equivalent to:
+	0.000175259871 km travelled by car
+2024-07-03 23:53:31 - CarbonTracker: Live carbon intensity could not be fetched at detected location: Delhi, Delhi, IN. Defaulted to average carbon intensity for IN in 2021 of 626.01 gCO2/kWh. at detected location: Delhi, Delhi, IN.
+2024-07-03 23:53:31 - CarbonTracker: 
+Predicted consumption for 1 epoch(s):
+	Time:	0:00:01
+	Energy:	0.000053181533 kWh
+	CO2eq:	0.033292017307 g
+	This is equivalent to:
+	0.000309693184 km travelled by car
+2024-07-03 23:53:31 - CarbonTracker: Finished monitoring.

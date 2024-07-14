@@ -358,7 +358,7 @@ def eval_boolq(datadir, preddir, outdir):
                 # print(preddata[:5])
 
         except FileNotFoundError:
-            print("Skipping", dn)
+            # print("Skipping", dn)
             continue         
             
         outdata.append([modelname])

@@ -1,0 +1,12 @@
+2024-07-03 23:50:34 - carbontracker version 1.2.5
+2024-07-03 23:50:34 - Only predicted and actual consumptions are multiplied by a PUE coefficient of 1.55 (Rhonda Ascierto, 2022, Uptime Institute Global Data Center Survey).
+2024-07-03 23:50:34 - The following components were found: GPU with device(s) NVIDIA RTX A5000. CPU with device(s) cpu:1, cpu:0.
+2024-07-03 23:50:34 - Monitoring thread started.
+2024-07-03 23:50:36 - Epoch 1:
+2024-07-03 23:50:36 - Duration: 0:00:00.15
+2024-07-03 23:50:36 - Average power usage (W) for gpu: [58.13]
+2024-07-03 23:50:36 - Average power usage (W) for cpu: None
+2024-07-03 23:50:36 - Carbon intensities (gCO2/kWh) fetched every 900 s at detected location Delhi, Delhi, IN: [626.0071]
+2024-07-03 23:50:36 - Average carbon intensity during training was 626.01 gCO2/kWh at detected location: Delhi, Delhi, IN.
+2024-07-03 23:50:36 - Live carbon intensity could not be fetched at detected location: Delhi, Delhi, IN. Defaulted to average carbon intensity for IN in 2021 of 626.01 gCO2/kWh. at detected location: Delhi, Delhi, IN.
+2024-07-03 23:50:36 - Monitoring thread ended.

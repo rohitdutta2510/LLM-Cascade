@@ -22,7 +22,7 @@ from sklearn.metrics import f1_score, precision_score, recall_score
 PREDDIR = '../temp_outs/'
 TRAIN_DATA_PATH = '../datasets/boolq_train_1k.csv'
 TEST_DATA_PATH = '../datasets/boolq_test_1k.csv'
-OUTDIR = '../performance/'
+PERF_OUT_DIR = '../performance/'
 ENERGY_OUT_DIR_BASE = '../temp_outs/'
 
 DEVICE = 'cuda:0'
@@ -106,8 +106,6 @@ def train(train_texts, train_labels, lr, epochs, save_dir = './boolq'):
         learning_rate=lr,  
         per_device_train_batch_size=16,  # batch size per device during training
         per_device_eval_batch_size=64,   # batch size for evaluation
-        # warmup_steps=500,                # number of warmup steps for learning rate scheduler
-        # weight_decay=0.01,               # strength of weight decay
         logging_dir='./logs',            # directory for storing logs
         logging_steps=10,
         evaluation_strategy="epoch",
@@ -136,9 +134,12 @@ def train(train_texts, train_labels, lr, epochs, save_dir = './boolq'):
 
 def build_cascade(llm_chain, cascade_name = 'default', lr = 1e-5, epochs = 10):
 
-    for model in llm_chain:
+    for model_path in llm_chain:
+        model = model_path.split('/')[-1]
+        print(f'\nTraining Scorer for {model}\n')
+
         data = get_data_boolq(TRAIN_DATA_PATH, PREDDIR, model)
-        # save_path = '../models/boolq/' + cascade_name + '/' + model
+
         save_path = os.path.join('../models/boolq', cascade_name, model)
         train(data['query_answer'], data['score'], lr, epochs, save_path)
 
@@ -150,34 +151,47 @@ def build_cascade(llm_chain, cascade_name = 'default', lr = 1e-5, epochs = 10):
 
 ################################################################################################################
 
-def get_score(text, scorer_path):
+def get_score(text, scorer_path, data_name, cascade_name, thresh, batch_offset, ENERGY_OUT_DIR):
     model = DistilBertForSequenceClassification.from_pretrained(scorer_path)
     tokenizer = DistilBertTokenizerFast.from_pretrained('distilbert-base-uncased')
     model = model.to(DEVICE)
 
     test_encodings = tokenizer(text, truncation=True, padding=True, max_length=512, return_tensors='pt')
     test_encodings = {key: value.to(DEVICE) for key, value in test_encodings.items()}
-
-    model.eval()
-
     dataset = data_utils.TensorDataset(test_encodings['input_ids'], test_encodings['attention_mask'])
     dataloader = data_utils.DataLoader(dataset, batch_size=4)
 
     all_probs = []
-
+    new_batch_offset = None
     model.eval()
-    with torch.no_grad():
-        for batch in dataloader:
-            input_ids, attention_mask = batch
-            outputs = model(input_ids=input_ids, attention_mask=attention_mask)
-            probs = F.softmax(outputs.logits, dim=-1)
-            all_probs.extend(probs.cpu().numpy())
+    try:
+        with torch.no_grad():
+            for idx, batch in enumerate(tqdm(dataloader, ncols=50)):
+                bn = batch_offset + idx
+                with OfflineEmissionsTracker(project_name="%s_%s-%s_%d"%(data_name, cascade_name, thresh, bn), experiment_id=bn, country_iso_code="IND", log_level="error",
+                                        tracking_mode="process", output_dir=ENERGY_OUT_DIR, measure_power_secs=1, gpu_ids=TRACK_GPU) as tracker2:
+                    input_ids, attention_mask = batch
+                    outputs = model(input_ids=input_ids, attention_mask=attention_mask)
+                
+                probs = F.softmax(outputs.logits, dim=-1)
+                all_probs.extend(probs.cpu().numpy())
+                new_batch_offset = bn
+
+                gc.collect()
+                torch.cuda.empty_cache()
+
+    except Exception as e:
+        print("ERROR:", e)
+        tracker2.stop()
+        raise e
     
-    return all_probs
+    new_batch_offset +=1
+
+    return all_probs, new_batch_offset
 
 ################################################################################################################
 
-def run_llm(model_path, data_loader, data_name, cascade_name, thresh, batch_offset, ENERGY_OUT_DIR, maxgentokens=50):
+def load_model(model_path):
     if 'Phi-3' in model_path:
         tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
     else:
@@ -198,6 +212,12 @@ def run_llm(model_path, data_loader, data_name, cascade_name, thresh, batch_offs
         tokenizer.pad_token = tokenizer.eos_token
         model.config.pad_token_id = tokenizer.eos_token_id
 
+    return model, tokenizer
+################################################################################################################
+
+def run_llm(model_path, data_loader, data_name, cascade_name, thresh, batch_offset, ENERGY_OUT_DIR, maxgentokens=50):
+    # Load Model and Tokenizer
+    model, tokenizer = load_model(model_path)
 
     results = []
     timestamps = []
@@ -231,14 +251,13 @@ def run_llm(model_path, data_loader, data_name, cascade_name, thresh, batch_offs
         raise e
     
     results = tokenizer.batch_decode(results, skip_special_tokens=True)
-    torch.cuda.empty_cache()
+    new_batch_offset += 1
 
     return results, new_batch_offset
 
 ################################################################################################################
 
 def data_thresholding(rawdata, preds, golds, score, thresh):
-    comp_prompts = []
     comp_preds = []
     comp_golds = []
     rem_prompts = []
@@ -246,14 +265,13 @@ def data_thresholding(rawdata, preds, golds, score, thresh):
 
     for raw, pr, gd, sc in zip(rawdata, preds, golds, score):
         if sc[1] > thresh:
-            comp_prompts.append(raw)
             comp_preds.append(pr)
             comp_golds.append(gd)
         else:
             rem_prompts.append(raw)
             rem_golds.append(gd)
 
-    return comp_prompts, comp_preds, comp_golds, rem_prompts, rem_golds
+    return comp_preds, comp_golds, rem_prompts, rem_golds
 
 ################################################################################################################
 
@@ -265,22 +283,22 @@ def run_cascade(cascade_name, llm_chain, cascade_length, data_path, threshold = 
         os.makedirs(ENERGY_OUT_DIR)
     else:
         os.system("rm " + os.path.join(ENERGY_OUT_DIR, "emissions.csv"))
-    
-    # print('Cascade Length: ', cascade_length)
+
     df = pd.read_csv(data_path)
     df = df.sort_values('prompt_text', key = lambda col: col.apply(len))
     raw_prompts = df['prompt_text'].values.tolist()
     raw_golds = df['label'].values.tolist()
     # raw_golds = ["true" if gd == 1 else "false" for gd in raw_golds]
+    # raw_prompts = raw_prompts[:5]
+    # raw_golds = raw_golds[:5]
     
-    final_prompts = []
     final_preds = []
     final_golds = []
 
     batch_offset = 0
     for idx, llm in enumerate(llm_chain):
         print(f'\n{idx+1}. {llm}')
-        data_loader = data_utils.DataLoader(raw_prompts, batch_size=32)
+        data_loader = data_utils.DataLoader(raw_prompts, batch_size=4)
         model_name = llm.split('/')[-1]
         pred_data, batch_offset = run_llm(llm, data_loader, data_name, cascade_name, threshold, batch_offset, ENERGY_OUT_DIR)
         
@@ -290,11 +308,12 @@ def run_cascade(cascade_name, llm_chain, cascade_length, data_path, threshold = 
         # pred_data = map(str.lower, response[0]) 
         # pred_data = [1 if "true" in pr or "yes" in pr else 0 for pr in pred_data] 
         # pred_data = list(pred_data)
-        print(pred_data[:5])
+        # print(pred_data[:5])
 
         if idx+1 != cascade_length:       # if current llm is not the last llm of the chain
-            qa = [query + str(ans) for query, ans in zip(raw_prompts, pred_data)] 
-            score = get_score(qa, '../models/boolq/' + cascade_name + '/' + model_name)
+            qa = [query + str(ans) for query, ans in zip(raw_prompts, pred_data)]
+            scorer_path =  '../models/boolq/' + cascade_name + '/' + model_name
+            score, batch_offset = get_score(qa, scorer_path, data_name, cascade_name, threshold, batch_offset, ENERGY_OUT_DIR)
             
             pred_data = map(str.lower, pred_data)
             pred_data = [1 if "true" in pr or "yes" in pr else 0 for pr in pred_data]
@@ -304,26 +323,23 @@ def run_cascade(cascade_name, llm_chain, cascade_length, data_path, threshold = 
             # print(score[:5])
             # break
 
-            comp_prompts, comp_preds, comp_golds, rem_prompts, rem_golds = data_thresholding(raw_prompts, pred_data, raw_golds, score, threshold)
-            final_prompts.extend(comp_prompts)
+            comp_preds, comp_golds, rem_prompts, rem_golds = data_thresholding(raw_prompts, pred_data, raw_golds, score, threshold)
             final_preds.extend(comp_preds)
             final_golds.extend(comp_golds)
 
             raw_prompts = rem_prompts
             raw_golds = rem_golds
-            batch_offset += 1
 
-            print(f'Completed: {len(final_prompts)}, Remaining: {len(raw_prompts)}')
+            print(f'Completed: {len(final_golds)}, Remaining: {len(rem_golds)}')
 
             if len(raw_prompts) == 0:
                 break
         else:
-            final_prompts.extend(raw_prompts)
+            pred_data = map(str.lower, pred_data)
+            pred_data = [1 if "true" in pr or "yes" in pr else 0 for pr in pred_data]
+
             final_preds.extend(pred_data)
             final_golds.extend(raw_golds)
-
-    # final_golds = [1 if "true" in gd else 0 for gd in final_golds]
-    # final_preds = [1 if "true" in pr or "yes" in pr else 0 for pr in final_preds]
 
     prec = round(precision_score(final_golds, final_preds, average="macro") * 100, 1)
     rec = round(recall_score(final_golds, final_preds, average="macro") * 100, 1)
@@ -340,29 +356,40 @@ if __name__ == '__main__':
 
     # TRAINING
 
-    llm_chain = ['flan-t5-base', 'flan-t5-large', 'flan-t5-xl']
-    model_list = ['dummy']
-    lr_rate = [2e-5]
-    num_epochs = 10
+    # llm_chain = ['flan-t5-base', 'flan-t5-large', 'flan-t5-xl']
+    # llm_chain = ['microsoft/Phi-3-mini-4k-instruct', 'microsoft/Phi-3-small-8k-instruct', 'microsoft/Phi-3-medium-4k-instruct']
+    # model_list = ['strategy-8']
+    # lr_rate = [4e-5]
+    # num_epochs = 10
 
-    for model, lr in zip(model_list, lr_rate):
-        build_cascade(llm_chain, model, lr, num_epochs)
+    # for model, lr in zip(model_list, lr_rate):
+    #     build_cascade(llm_chain, model, lr, num_epochs)
 
     # INFERENCE
 
-    # if not os.path.exists(OUTDIR):
-    #     os.makedirs(OUTDIR)
+    if not os.path.exists(PERF_OUT_DIR):
+        os.makedirs(PERF_OUT_DIR)
+
+    output_file_path = PERF_OUT_DIR + "boolq_st7-8.csv"
+    if not os.path.exists(output_file_path):
+        df = pd.DataFrame(columns = ["Model", "Threshold", "M-Pre", "M-Rec", "M-F1"])
+        df.to_csv(output_file_path, index=False)
 
     # chain_1 = ['google/flan-t5-base', 'google/flan-t5-large', 'google/flan-t5-xl']
-    # model_list = ['strategy-5']
-    # chain_list = [chain_1]
-    # threshold = [0.60, 0.65, 0.70, 0.75, 0.80, 0.85, 0.90, 0.95]
+    chain_2 = ['microsoft/Phi-3-mini-4k-instruct', 'microsoft/Phi-3-small-8k-instruct', 'microsoft/Phi-3-medium-4k-instruct']
+    model_list = ['strategy-7', 'strategy-8']
+    chain_list = [chain_2, chain_2]
+    threshold = [0.60, 0.65, 0.70, 0.75, 0.80, 0.85, 0.90, 0.95]
 
-    # output = []
-    # for model, llm_chain in zip(model_list, chain_list):
-    #     for th in threshold:
-    #         print(f'\nRunning boolq.py ---> Model: {model}, Threshold: {th}\n')
-    #         output.append(run_cascade(model, llm_chain, len(llm_chain), TEST_DATA_PATH, th))
+    for model, llm_chain in zip(model_list, chain_list):
+        for th in threshold:
+            print(f'\nRunning boolq.py ---> Model: {model}, Threshold: {th}\n')
+            perf = run_cascade(model, llm_chain, len(llm_chain), TEST_DATA_PATH, th)
+            new_output = pd.DataFrame([perf], columns = ["Model", "Threshold", "M-Pre", "M-Rec", "M-F1"])
+
+            prev_output = pd.read_csv(output_file_path)
+            df = pd.concat([prev_output, new_output], ignore_index=True)
+            df.to_csv(output_file_path, index=False)
 
     # df = pd.DataFrame(output, columns = ["Model", "Threshold", "M-Pre", "M-Rec", "M-F1"])
-    # df.to_csv(os.path.join(OUTDIR, "boolq_st1-4.csv"), index = False)
+    # df.to_csv(os.path.join(PERF_OUT_DIR, "boolq_st7-8.csv"), index = False)
