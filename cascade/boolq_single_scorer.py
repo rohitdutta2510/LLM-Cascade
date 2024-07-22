@@ -1,5 +1,6 @@
 import os
 import gc
+import re
 import json
 import pandas as pd
 import numpy as np
@@ -32,24 +33,21 @@ metric = evaluate.load("accuracy")
 
 ################################################################################################################
 
-def get_data_boolq(datadir, preddir, modelname):
+def get_data_boolq(datadir, preddir, model_name):
     rawdata = pd.read_csv(datadir)
     rawdata = rawdata.sort_values('prompt_text', key = lambda col: col.apply(len))
     gold = rawdata['label'].values.tolist()
-    # gold = ["true" if gd == 1 else "false" for gd in gold]
     
-    dn = preddir + '/boolq_train_1k_' + modelname + '/'
+    dn = preddir + '/boolq_train_1k_' + model_name + '/'
         
     try:
         with open(os.path.join(dn, "output.json")) as fp:
-            preddata, timestamps = json.load(fp)
-            if 'flan' not in modelname:
-                preddata = [pr[len(raw):] for pr, raw in zip(preddata, rawdata.prompt_text)]
-            # preddata = map(str.lower, preddata) 
-            answer = list(preddata)
-            preddata = map(str.lower, preddata) 
-            pred = [1 if "true" in pr or "yes" in pr else 0 for pr in preddata]
+            pred_data, ts = json.load(fp)
+            if 'flan' not in model_name:
+                pred_data = [pr[len(raw):] for pr, raw in zip(pred_data, rawdata.prompt_text)]
             
+            answer = pred_data.copy()
+            pred = get_prediction_class(pred_data, model_name) 
 
     except FileNotFoundError:
         print("Skipping", dn)       
@@ -64,6 +62,18 @@ def get_data_boolq(datadir, preddir, modelname):
 
     return qa, result
 
+################################################################################################################
+
+def get_prediction_class(pred_data, model_name):
+    if 'flan' not in model_name:
+        pred_data = [re.sub(r'\n', ' ', pr) for pr in pred_data]
+        pred_data = [re.sub(r'[^A-Za-z0-9\s]', ' ', pr) for pr in pred_data]
+        pred_data = [' '.join(pr.split()[:5]) for pr in pred_data]
+        
+    pred_data = map(str.lower, pred_data) 
+    pred_data = [1 if "true" in pr or "yes" in pr else 0 for pr in pred_data]
+
+    return pred_data
 ################################################################################################################
 
 class CustomDataset(torch.utils.data.Dataset):
@@ -90,10 +100,10 @@ def compute_metrics(eval_pred):
 
 def train(train_texts, train_labels, lr, epochs, save_dir = './boolq'):
     train_texts, val_texts, train_labels, val_labels = train_test_split(train_texts, train_labels, test_size=.2)
-    # print("train_text 0",train_texts[0])
-    # print("val_text 0",val_texts[0])
 
     tokenizer = DistilBertTokenizerFast.from_pretrained('distilbert-base-uncased')
+    model = DistilBertForSequenceClassification.from_pretrained("distilbert-base-uncased")
+
     train_encodings = tokenizer(train_texts, truncation=True, padding=True,max_length=512)
     val_encodings = tokenizer(val_texts, truncation=True, padding=True,max_length=512)
 
@@ -101,32 +111,27 @@ def train(train_texts, train_labels, lr, epochs, save_dir = './boolq'):
     val_dataset = CustomDataset(val_encodings, val_labels)
 
     training_args = TrainingArguments(
-        output_dir='../checkpoints',          # output directory
-        num_train_epochs=epochs,              # total number of training epochs
-        learning_rate=lr,                # initial learning rate
-        per_device_train_batch_size=32,  # batch size per device during training
-        per_device_eval_batch_size=64,   # batch size for evaluation
-        logging_dir='./logs',            # directory for storing logs
-        logging_steps=10,
+        output_dir='../checkpoints',         
+        num_train_epochs=epochs,            
+        learning_rate=lr,                
+        per_device_train_batch_size=32, 
+        per_device_eval_batch_size=64,   
         evaluation_strategy="epoch",
         save_strategy ="epoch",
         load_best_model_at_end=True,
         # seed=42,
     )
 
-    model = DistilBertForSequenceClassification.from_pretrained("distilbert-base-uncased")
-    
     model = model.to(DEVICE)
     trainer = Trainer(
-        model=model,                         # the instantiated 🤗 Transformers model to be trained
-        args=training_args,                  # training arguments, defined above
-        train_dataset=train_dataset,         # training dataset
-        eval_dataset=val_dataset ,            # evaluation dataset
+        model=model,                         
+        args=training_args,                 
+        train_dataset=train_dataset,        
+        eval_dataset=val_dataset ,            
         compute_metrics=compute_metrics,
     )
 
     trainer.train()
-
     model.save_pretrained(save_dir)
     # tokenizer.save_pretrained(save_dir)
         
@@ -194,21 +199,26 @@ def get_score(text, scorer_path, data_name, cascade_name, thresh, batch_offset, 
 ################################################################################################################
 
 def load_model(model_path):
+    # Load Tokenizer
     if 'Phi-3' in model_path:
         tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
     else:
         tokenizer = AutoTokenizer.from_pretrained(model_path)
 
+    # Load Model
     if 'flan-t5' in model_path:
         model = AutoModelForSeq2SeqLM.from_pretrained(model_path, device_map = DEVICE, torch_dtype=torch.float16)
     elif 'Phi-3-medium-4k-instruct' in model_path:
+        print("\nLoading 8-bit quantized model\n")
         quantization_config = BitsAndBytesConfig(load_in_8bit=True, bnb_8bit_compute_dtype=torch.float16)
         model = AutoModelForCausalLM.from_pretrained(model_path, quantization_config=quantization_config, device_map = DEVICE, torch_dtype=torch.float16, trust_remote_code=True, attn_implementation="flash_attention_2")
     elif 'Phi-3' in model_path:
         model = AutoModelForCausalLM.from_pretrained(model_path, device_map = DEVICE, torch_dtype=torch.bfloat16, trust_remote_code=True, attn_implementation="flash_attention_2")
     else:
         model = AutoModelForCausalLM.from_pretrained(model_path, device_map = DEVICE, torch_dtype=torch.bfloat16)
-  
+
+    # Configure eos and pad tokens
+    if 'flan-t5' not in model_path:
         tokenizer.padding_side = "left"
         tokenizer.pad_token_id = tokenizer.eos_token_id
         tokenizer.pad_token = tokenizer.eos_token
@@ -237,7 +247,8 @@ def run_llm(model_path, data_loader, data_name, cascade_name, thresh, batch_offs
                 inp = batchdata.input_ids.to(DEVICE)
                 attn = batchdata.attention_mask.to(DEVICE)
                 
-                outputs = model.generate(inp, attention_mask=attn, max_new_tokens=maxgentokens, pad_token_id=tokenizer.pad_token_id)
+                # outputs = model.generate(inp, attention_mask=attn, max_new_tokens=maxgentokens, pad_token_id=tokenizer.pad_token_id)
+                outputs = model.generate(inp, attention_mask=attn, max_new_tokens=maxgentokens, pad_token_id=tokenizer.pad_token_id, eos_token_id=tokenizer.eos_token_id)
 
                 end = time()
 
@@ -291,7 +302,6 @@ def run_cascade(cascade_name, llm_chain, cascade_length, data_path, threshold=0.
     df = df.sort_values('prompt_text', key = lambda col: col.apply(len))
     raw_prompts = df['prompt_text'].values.tolist()
     raw_golds = df['label'].values.tolist()
-    # raw_golds = ["true" if gd == 1 else "false" for gd in raw_golds]
     # raw_prompts = raw_prompts[:5]
     # raw_golds = raw_golds[:5]
     
@@ -307,25 +317,17 @@ def run_cascade(cascade_name, llm_chain, cascade_length, data_path, threshold=0.
         
         if 'flan' not in model_name:
             pred_data = [pr[len(raw):] for pr, raw in zip(pred_data, raw_prompts)]
-        
-        # pred_data = map(str.lower, response[0]) 
-        # pred_data = [1 if "true" in pr or "yes" in pr else 0 for pr in pred_data] 
-        # pred_data = list(pred_data)
-        # print(pred_data[:5])
 
         if idx+1 != cascade_length:       # if current llm is not the last llm of the chain
             qa = [query + str(ans) for query, ans in zip(raw_prompts, pred_data)] 
             scorer_path = '../models/boolq-single-scorer/' + cascade_name
             score, batch_offset = get_score(qa, scorer_path, data_name, cascade_name, threshold, batch_offset, ENERGY_OUT_DIR)
 
-            pred_data = map(str.lower, pred_data)
-            pred_data = [1 if "true" in pr or "yes" in pr else 0 for pr in pred_data]
-
+            pred_data = get_prediction_class(pred_data, model_name)
             # print(pred_data[:5])
             # print(qa[:5])
             # print(score[:5])
             # break
-
             comp_preds, comp_golds, rem_prompts, rem_golds = data_thresholding(raw_prompts, pred_data, raw_golds, score, threshold)
             final_preds.extend(comp_preds)
             final_golds.extend(comp_golds)
@@ -338,9 +340,7 @@ def run_cascade(cascade_name, llm_chain, cascade_length, data_path, threshold=0.
             if len(raw_prompts) == 0:
                 break
         else:
-            pred_data = map(str.lower, pred_data)
-            pred_data = [1 if "true" in pr or "yes" in pr else 0 for pr in pred_data]
-
+            pred_data = get_prediction_class(pred_data, model_name)
             final_preds.extend(pred_data)
             final_golds.extend(raw_golds)
 
@@ -361,7 +361,7 @@ if __name__ == '__main__':
 
     # llm_chain = ['flan-t5-base', 'flan-t5-large', 'flan-t5-xl']
     # llm_chain = ['microsoft/Phi-3-mini-4k-instruct', 'microsoft/Phi-3-small-8k-instruct', 'microsoft/Phi-3-medium-4k-instruct']
-    # model_list = ['strategy-7', 'strategy-8']
+    # model_list = ['strategy-9', 'strategy-10']
     # lr_rate = [2e-5, 4e-5]
     # num_epochs = 10
 
@@ -373,14 +373,14 @@ if __name__ == '__main__':
     if not os.path.exists(PERF_OUT_DIR):
         os.makedirs(PERF_OUT_DIR)
 
-    output_file_path = PERF_OUT_DIR + "boolq_single_scorer_st7-8.csv"
+    output_file_path = PERF_OUT_DIR + "boolq_single_scorer_st9-10.csv"
     if not os.path.exists(output_file_path):
         df = pd.DataFrame(columns = ["Model", "Threshold", "M-Pre", "M-Rec", "M-F1"])
         df.to_csv(output_file_path, index=False)
 
     # chain_1 = ['google/flan-t5-base', 'google/flan-t5-large', 'google/flan-t5-xl']
     chain_2 = ['microsoft/Phi-3-mini-4k-instruct', 'microsoft/Phi-3-small-8k-instruct', 'microsoft/Phi-3-medium-4k-instruct']
-    model_list = ['strategy-7', 'strategy-8']
+    model_list = ['strategy-9', 'strategy-10']
     chain_list = [chain_2, chain_2]
     threshold = [0.60, 0.65, 0.70, 0.75, 0.80, 0.85, 0.90, 0.95]
 
